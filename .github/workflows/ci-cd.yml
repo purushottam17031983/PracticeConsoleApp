@@ -1,0 +1,275 @@
+name: CI/CD
+
+# "After each commit" = a push event. Restricted to main so feature branches
+# don't trigger deployments; open a PR and merge to main to ship.
+on:
+  push:
+    branches: [main]
+
+# A newer commit cancels whatever's still running for the same branch,
+# instead of two pipelines racing to deploy against each other.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'sqs-bulk-push-function' }}
+  LAMBDA_FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME || 'sqs-bulk-push' }}
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Stage 1: build the solution and run the unit tests. Every job below
+  # declares the previous stage in `needs:`, and GitHub Actions skips a job
+  # automatically the moment anything it needs fails - that's what enforces
+  # "don't move on if this stage fails" throughout the whole file.
+  # ---------------------------------------------------------------------
+  build-and-test:
+    name: 1 - Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Restore
+        run: dotnet restore PracticeConsoleApp.slnx
+
+      - name: Build (Release)
+        run: dotnet build PracticeConsoleApp.slnx --configuration Release --no-restore
+
+      - name: Test with coverage
+        run: >
+          dotnet test PracticeConsoleApp.Tests/PracticeConsoleApp.Tests.csproj
+          --configuration Release --no-build
+          --logger "trx;LogFileName=test-results.trx"
+          --results-directory ./TestResults
+          /p:CollectCoverage=true
+          /p:CoverletOutputFormat=opencover
+          /p:CoverletOutput=../TestResults/coverage/
+
+      # Sonar (a separate job/runner) needs this coverage report and test
+      # log to attach coverage and test-execution data to its analysis.
+      - name: Upload test results & coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # Stage 2: SonarCloud/SonarQube analysis. The custom Quality Gate set up
+  # once via scripts/setup-sonar-quality-gate.sh fails analysis if coverage
+  # is under 70% or any code smell exists; sonar.qualitygate.wait=true makes
+  # the `sonarscanner end` step itself exit non-zero when that happens,
+  # which fails this job and blocks stage 3.
+  # ---------------------------------------------------------------------
+  sonar-quality-gate:
+    name: 2 - SonarCloud Quality Gate
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Sonar wants full git history for blame/new-code analysis
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17' # the Sonar Scanner runs on the JVM
+
+      - name: Download coverage from stage 1
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: TestResults
+
+      - name: Install dotnet-sonarscanner
+        run: dotnet tool install --global dotnet-sonarscanner
+
+      - name: Restore
+        run: dotnet restore PracticeConsoleApp.slnx
+
+      - name: Sonar begin
+        run: >
+          dotnet sonarscanner begin
+          /k:"${{ vars.SONAR_PROJECT_KEY }}"
+          /o:"${{ vars.SONAR_ORGANIZATION }}"
+          /d:sonar.host.url="${{ vars.SONAR_HOST_URL || 'https://sonarcloud.io' }}"
+          /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+          /d:sonar.cs.opencover.reportsPaths="TestResults/coverage/coverage.opencover.xml"
+          /d:sonar.cs.vstest.reportsPaths="TestResults/test-results.trx"
+          /d:sonar.coverage.exclusions="**/TestDoubles/**,**/*Tests.cs"
+          /d:sonar.qualitygate.wait=true
+
+      - name: Build (analysis pass)
+        run: dotnet build PracticeConsoleApp.slnx --configuration Release --no-restore
+
+      - name: Sonar end (blocks on the Quality Gate)
+        run: dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+
+  # ---------------------------------------------------------------------
+  # Stage 3: package the Lambda function as a container image and push it
+  # to ECR. Only runs if the Quality Gate above passed.
+  # ---------------------------------------------------------------------
+  docker-build-and-push:
+    name: 3 - Build & Push Docker Image
+    needs: sonar-quality-gate
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # for AWS OIDC login - no long-lived AWS keys in secrets
+      contents: read
+    outputs:
+      image-uri: ${{ steps.build-image.outputs.image-uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR repository exists
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" \
+            || aws ecr create-repository --repository-name "$ECR_REPOSITORY" --image-scanning-configuration scanOnPush=true
+
+      - name: Build, tag & push image
+        id: build-image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build -f PracticeConsoleApp.SqsBulkPushFunction/Dockerfile \
+            -t "$IMAGE_URI" -t "$REGISTRY/$ECR_REPOSITORY:latest" .
+          docker push "$IMAGE_URI"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          echo "image-uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # Stage 3b: hand the image off to Octopus Deploy, which owns the actual
+  # deployment process for the Lambda function (see the "Octopus setup"
+  # notes below - that process lives on the Octopus server, not in this
+  # file). wait_for_deployment blocks and fails this job if Octopus's
+  # deployment fails.
+  # ---------------------------------------------------------------------
+  octopus-deploy:
+    name: 3b - Deploy via Octopus Deploy
+    needs: docker-build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Octopus CLI
+        uses: OctopusDeploy/install-octopus-cli-action@v3
+        with:
+          version: latest
+
+      - name: Create Octopus release
+        uses: OctopusDeploy/create-release-action@v3
+        with:
+          server: ${{ secrets.OCTOPUS_SERVER_URL }}
+          api_key: ${{ secrets.OCTOPUS_API_KEY }}
+          space: ${{ vars.OCTOPUS_SPACE || 'Default' }}
+          project: ${{ vars.OCTOPUS_PROJECT || 'PracticeConsoleApp - SQS Bulk Push' }}
+          release_number: ${{ github.run_number }}
+          variables: |
+            ImageUri=${{ needs.docker-build-and-push.outputs.image-uri }}
+
+      - name: Deploy release & wait for completion
+        uses: OctopusDeploy/deploy-release-action@v3
+        with:
+          server: ${{ secrets.OCTOPUS_SERVER_URL }}
+          api_key: ${{ secrets.OCTOPUS_API_KEY }}
+          space: ${{ vars.OCTOPUS_SPACE || 'Default' }}
+          project: ${{ vars.OCTOPUS_PROJECT || 'PracticeConsoleApp - SQS Bulk Push' }}
+          release_number: ${{ github.run_number }}
+          environments: ${{ vars.OCTOPUS_ENVIRONMENT || 'Production' }}
+          wait_for_deployment: true
+          cancel_on_timeout: true
+
+  # ---------------------------------------------------------------------
+  # Stage 4: smoke-test the function that's now live in Lambda by actually
+  # invoking it, and fail the pipeline if it errored or returned something
+  # unexpected.
+  # ---------------------------------------------------------------------
+  post-deploy-smoke-test:
+    name: 4 - Post-Deploy Automation Test
+    needs: octopus-deploy
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Invoke deployed Lambda and assert the response
+        run: |
+          aws lambda invoke \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{"MessageCount":1}' \
+            response.json > invoke-meta.json
+
+          echo "--- invocation metadata ---"; cat invoke-meta.json
+          echo "--- response body ---"; cat response.json
+
+          STATUS_CODE=$(jq -r '.StatusCode' invoke-meta.json)
+          FUNCTION_ERROR=$(jq -r '.FunctionError // empty' invoke-meta.json)
+
+          if [ "$STATUS_CODE" != "200" ] || [ -n "$FUNCTION_ERROR" ]; then
+            echo "Smoke test FAILED: StatusCode=$STATUS_CODE FunctionError=$FUNCTION_ERROR"
+            exit 1
+          fi
+
+          if ! grep -q '"Sent 1/1 messages, 0 permanent failures"' response.json; then
+            echo "Smoke test FAILED: unexpected response body"
+            exit 1
+          fi
+
+          echo "Smoke test PASSED"
+
+  # ---------------------------------------------------------------------
+  # Stage 5: notify. `if: always()` makes this job run even though its one
+  # dependency may have failed or been skipped - normally a failed/skipped
+  # dependency would skip this job too - so it can report either outcome.
+  # ---------------------------------------------------------------------
+  notify:
+    name: 5 - Notify
+    needs: post-deploy-smoke-test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack - success
+        if: needs.post-deploy-smoke-test.result == 'success'
+        run: |
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":white_check_mark: *${{ github.repository }}* - commit \`${{ github.sha }}\` built, scanned, deployed to Lambda and passed post-deploy automation tests.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+
+      - name: Notify Slack - failure
+        if: needs.post-deploy-smoke-test.result != 'success'
+        run: |
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":x: *${{ github.repository }}* - pipeline failed for commit \`${{ github.sha }}\`.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
