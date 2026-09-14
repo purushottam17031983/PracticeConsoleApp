@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AWSProjectType>Lambda</AWSProjectType>
+    <!-- Managed Lambda runtime needs a normal deployable assembly, not a
+         native AOT binary, so these stay off regardless of what the
+         referenced console project sets. -->
+    <PublishAot>false</PublishAot>
+    <PublishReadyToRun>true</PublishReadyToRun>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Amazon.Lambda.Core" Version="2.5.0" />
+    <PackageReference Include="Amazon.Lambda.Serialization.SystemTextJson" Version="2.4.4" />
+    <PackageReference Include="AWSSDK.SQS" Version="4.0.100.13" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The console project targets net10.0, which this net8.0 Lambda project
+         can't take a ProjectReference on (a lower TFM can't reference a
+         higher one). Link the specific source files it needs instead of
+         duplicating them. -->
+    <Compile Include="..\PracticeConsoleApp\SqsBulkPublisher.cs" Link="Shared\SqsBulkPublisher.cs" />
+    <Compile Include="..\PracticeConsoleApp\AwsSqsBatchClient.cs" Link="Shared\AwsSqsBatchClient.cs" />
+  </ItemGroup>
+
+</Project>

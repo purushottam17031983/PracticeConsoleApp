@@ -1,0 +1,14 @@
+## .NET
+bin/
+obj/
+*.user
+
+## Visual Studio
+.vs/
+
+## AWS
+*.publishsettings
+
+## OS
+Thumbs.db
+.DS_Store

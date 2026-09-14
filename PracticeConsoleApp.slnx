@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="PracticeConsoleApp/PracticeConsoleApp.csproj" />
+  <Project Path="PracticeConsoleApp.SqsBulkPushFunction/PracticeConsoleApp.SqsBulkPushFunction.csproj" />
+</Solution>
