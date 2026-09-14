@@ -1,4 +1,5 @@
 <Solution>
   <Project Path="PracticeConsoleApp/PracticeConsoleApp.csproj" />
   <Project Path="PracticeConsoleApp.SqsBulkPushFunction/PracticeConsoleApp.SqsBulkPushFunction.csproj" />
+  <Project Path="PracticeConsoleApp.Tests/PracticeConsoleApp.Tests.csproj" />
 </Solution>
