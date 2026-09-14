@@ -2,7 +2,8 @@
   "Information": [
     "This file provides default values for the deployment wizard inside Visual Studio and the AWS Lambda commands added to the .NET CLI.",
     "To learn more about the Lambda commands with the .NET CLI, execute the following command at the command line in the project root directory: dotnet lambda help",
-    "All the command line options for the Lambda command can be specified in this file."
+    "All the command line options for the Lambda command can be specified in this file.",
+    "NOTE: the CI/CD pipeline (.github/workflows/ci-cd.yml) deploys this function as a container image via Docker/ECR/Octopus Deploy, not via 'dotnet lambda deploy-function'. This file (including environment-variables below) is only read by that zip-based CLI command, so it's for local/manual zip deploys - it has no effect on the pipeline. For a container-image function, ORDERS_QUEUE_URL must be set on the Lambda function's own configuration instead (an Octopus deploy-step variable, or 'aws lambda update-function-configuration --environment Variables={ORDERS_QUEUE_URL=...}')."
   ],
   "profile": "",
   "region": "us-east-1",
